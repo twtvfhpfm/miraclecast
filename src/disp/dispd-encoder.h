@@ -48,7 +48,16 @@ enum wfd_encoder_config
 	WFD_ENCODER_CONFIG_H264_PROFILE,
 	WFD_ENCODER_CONFIG_H264_LEVEL,
 	WFD_ENCODER_CONFIG_DEBUG_LEVEL,
+	WFD_ENCODER_CONFIG_LOCAL_RTP_PORT,		/* uint32: local UDP bind for RTP */
+	WFD_ENCODER_CONFIG_RTP_SSRC,			/* uint32: RTP SSRC (matches SETUP ssrc=) */
 };
+
+/* Must match SETUP Transport server_port / ssrc in dispd-out-session.c */
+#define DISPD_LOCAL_RTP_PORT	16384
+#define DISPD_LOCAL_RTCP_PORT	16385
+/* Fixed media SSRC announced in SETUP Transport and used by rtpmp2tpay */
+#define DISPD_RTP_SSRC		0xB9410795u
+#define DISPD_RTCP_FB_SSRC	0xB9410796u
 
 enum dispd_encoder_state
 {

@@ -657,7 +657,7 @@ private class DispCtl : GLib.Application
 		print("interface=%s", opt_iface);
 
 		if(null == opt_wfd_subelems) {
-			opt_wfd_subelems = "000600901c4400c8";
+			opt_wfd_subelems = "000600101c4400c8";
 		}
 		print("wfd_subelemens=%s", opt_wfd_subelems);
 

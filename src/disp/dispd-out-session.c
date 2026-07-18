@@ -30,8 +30,8 @@
 #include "ctl.h"
 #include "dispd-encoder.h"
 
-#define LOCAL_RTP_PORT		16384
-#define LOCAL_RTCP_PORT		16385
+#define LOCAL_RTP_PORT		DISPD_LOCAL_RTP_PORT
+#define LOCAL_RTCP_PORT		DISPD_LOCAL_RTCP_PORT
 #define KEEP_ALIVE_INTERVAL	30
 
 struct dispd_out_session
@@ -41,6 +41,8 @@ struct dispd_out_session
 	int fd;
 
 	struct dispd_encoder *encoder;
+	/* PLAY arrived before Configure finished; start when CONFIGURED. */
+	bool play_pending;
 
 	sd_event_source *keep_alive_timer;
 };
@@ -243,6 +245,7 @@ void dispd_out_session_destroy(struct dispd_session *s)
 		os->encoder = NULL;
 	}
 
+	os->play_pending = false;
 	os->sink = NULL;
 }
 
@@ -330,8 +333,8 @@ static int dispd_out_session_request_get_parameter(struct dispd_session *s,
 	}
 
 	r = rtsp_message_append(m, "{&}",
-			"wfd_video_formats\n"
-			"wfd_audio_codecs\n"
+			"wfd_video_formats\r\n"
+			"wfd_audio_codecs\r\n"
 			"wfd_client_rtp_ports"
 			//"wfd_uibc_capability"
 	);
@@ -342,18 +345,6 @@ static int dispd_out_session_request_get_parameter(struct dispd_session *s,
 	*out = (rtsp_message_ref(m), m);
 
 	return 0;
-}
-
-static bool find_strv(const char *str, char **strv)
-{
-	while(*strv) {
-		if(!strcmp(str, *strv)) {
-			return true;
-		}
-		++strv;
-	}
-
-	return false;
 }
 
 static int dispd_out_session_handle_options_request(struct dispd_session *s,
@@ -406,26 +397,24 @@ static int dispd_out_session_handle_options_reply(struct dispd_session *s,
 {
 	int r;
 	const char *public;
-	char *methods[4];
 
 	r = rtsp_message_read(m, "<&>", "Public", &public);
 	if(0 > r) {
 		return log_ERR(r);
 	}
 
-	r = sscanf(public, "%m[^,], %m[^,], %ms", &methods[0], &methods[1], &methods[2]);
-	if(3 != r) {
-		return log_EPROTO();
-	}
-
-	methods[3] = NULL;
-	r = find_strv("org.wfa.wfd1.0", methods) &&
-					find_strv("SET_PARAMETER", methods) &&
-					find_strv("GET_PARAMETER", methods);
-	free(methods[2]);
-	free(methods[1]);
-	free(methods[0]);
-	if(!r) {
+	/*
+	 * Real sinks (e.g. Samsung) advertise many methods:
+	 *   Public: org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER
+	 * The old parser only accepted exactly three comma-space fields, so
+	 * GET/SET_PARAMETER past the third entry caused a false protocol error.
+	 */
+	if (!public ||
+	    !strstr(public, "org.wfa.wfd1.0") ||
+	    !strstr(public, "SET_PARAMETER") ||
+	    !strstr(public, "GET_PARAMETER")) {
+		log_warning("unexpected OPTIONS Public header: %s",
+			    public ? public : "(null)");
 		return log_EPROTO();
 	}
 
@@ -549,11 +538,18 @@ static int dispd_out_session_handle_play_request(struct dispd_session *s,
 	}
 
 	e = dispd_out_session(s)->encoder;
+	/*
+	 * Do not start media until PLAY: starting at SETUP caused RTP/IDR
+	 * before the sink was ready (black screen on some TVs).
+	 */
 	if(DISPD_ENCODER_STATE_CONFIGURED <= dispd_encoder_get_state(e)) {
+		dispd_out_session(s)->play_pending = false;
 		r = dispd_encoder_start(e);
 		if(0 > r) {
 			return log_ERR(r);
 		}
+	} else {
+		dispd_out_session(s)->play_pending = true;
 	}
 
 	*out_rep = (rtsp_message_ref(m), m);
@@ -567,18 +563,21 @@ static void on_encoder_state_changed(struct dispd_encoder *e,
 {
 	int r = 0;
 	struct dispd_session *s = userdata;
+	struct dispd_out_session *os = dispd_out_session(s);
 
 	switch(state) {
 		case DISPD_ENCODER_STATE_SPAWNED:
 			if(dispd_session_is_state(s, DISPD_SESSION_STATE_SETTING_UP)) {
-				r = dispd_encoder_configure(dispd_out_session(s)->encoder, s);
+				r = dispd_encoder_configure(os->encoder, s);
 				if(0 > r) {
 					log_vERR(r);
 				}
 			}
 			break;
 		case DISPD_ENCODER_STATE_CONFIGURED:
-			if(dispd_session_is_state(s, DISPD_SESSION_STATE_SETTING_UP)) {
+			/* Start only after PLAY (or if PLAY already arrived). */
+			if(os->play_pending) {
+				os->play_pending = false;
 				r = dispd_encoder_start(e);
 				if(0 > r) {
 					log_vERR(r);
@@ -764,11 +763,15 @@ static int dispd_out_session_handle_setup_request(struct dispd_session *s,
 		return log_ERRNO();
 	}
 
-	r = asprintf(&trans, "RTP/AVP/UDP;unicast;client_port=%hu%s;server_port=%u-%u",
+	r = asprintf(&trans,
+					"RTP/AVP/UDP;unicast;client_port=%hu%s;"
+					"server_port=%u-%u;ssrc=%08x;rtcp-fb-ssrc=%08x",
 					s->stream.rtp_port,
 					l,
 					LOCAL_RTP_PORT,
-					LOCAL_RTCP_PORT);
+					LOCAL_RTCP_PORT,
+					DISPD_RTP_SSRC,
+					DISPD_RTCP_FB_SSRC);
 	if(0 > r) {
 		return log_ERRNO();
 	}
@@ -868,12 +871,12 @@ static int dispd_out_session_request_set_parameter(struct dispd_session *s,
 	s->stream.id = DISPD_STREAM_ID_PRIMARY;
 
 	r = asprintf(&body,
-					"wfd_video_formats: 00 00 02 10 %08X %08X %08X 00 0000 0000 00 none none\n"
-					"wfd_audio_codecs: AAC 00000001 00\n"
-					"wfd_presentation_URL: %s none\n"
+					"wfd_video_formats: 00 00 01 10 %08X %08X %08X 00 0000 0000 00 none none\r\n"
+					"wfd_audio_codecs: AAC 00000001 00\r\n"
+					"wfd_presentation_URL: %s none\r\n"
 					"wfd_client_rtp_ports: RTP/AVP/UDP;unicast %u %u mode=play",
-					//"wfd_uibc_capability: input_category_list=GENERIC\n;generic_cap_list=SingleTouch;hidc_cap_list=none;port=5100\n"
-					//"wfd_uibc_setting: disable\n",
+					//"wfd_uibc_capability: input_category_list=GENERIC\r\n;generic_cap_list=SingleTouch;hidc_cap_list=none;port=5100\r\n"
+					//"wfd_uibc_setting: disable\r\n",
 					0x80,
 					0,
 					0,

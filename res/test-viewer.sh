@@ -3,7 +3,7 @@
 # test gstreamer plugins required for miraclecast
 #
 
-plugins=(udpsrc rtpjitterbuffer rtpmp2tdepay tsdemux h264parse avdec_h264 autovideosink)
+plugins=(udpsrc rtpjitterbuffer rtph264depay h264parse avdec_h264 autovideosink)
 
 echo testing plugins required:
 echo

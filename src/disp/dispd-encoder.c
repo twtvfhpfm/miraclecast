@@ -777,6 +777,22 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct dispd_session *s)
 		return log_ERR(r);
 	}
 
+	r = config_append(call,
+					WFD_ENCODER_CONFIG_LOCAL_RTP_PORT,
+					"u",
+					DISPD_LOCAL_RTP_PORT);
+	if(0 > r) {
+		return log_ERR(r);
+	}
+
+	r = config_append(call,
+					WFD_ENCODER_CONFIG_RTP_SSRC,
+					"u",
+					DISPD_RTP_SSRC);
+	if(0 > r) {
+		return log_ERR(r);
+	}
+
 	if(s->stream.rtcp_port) {
 		r = config_append(call,
 						WFD_ENCODER_CONFIG_PEER_RTCP_PORT,
@@ -799,7 +815,7 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct dispd_session *s)
 		r = config_append(call,
 						WFD_ENCODER_CONFIG_LOCAL_RTCP_PORT,
 						"u",
-						s->stream.rtcp_port);
+						DISPD_LOCAL_RTCP_PORT);
 		if(0 > r) {
 			return log_ERR(r);
 		}

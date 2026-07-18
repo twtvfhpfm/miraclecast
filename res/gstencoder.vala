@@ -40,6 +40,8 @@ public enum DispdEncoderConfig
 	H264_PROFILE,
 	H264_LEVEL,
 	DEBUG_LEVEL,
+	LOCAL_RTP_PORT,		/* uint32: local UDP bind for RTP */
+	RTP_SSRC,			/* uint32: RTP SSRC (matches SETUP ssrc=) */
 }
 
 [DBus (name = "org.freedesktop.miracle.encoder.error")]
@@ -82,6 +84,9 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 	private Gst.Element pipeline;
 	private Gst.State pipeline_state = Gst.State.NULL;
 	private DispdEncoderState _state = DispdEncoderState.NULL;
+	private uint idr_timer_id = 0;
+	/* Force IDR every 5s so sinks that join late / drop early packets recover. */
+	private const uint IDR_INTERVAL_MS = 5000;
 
 	public DispdEncoderState state {
 		get { return _state; }
@@ -121,12 +126,12 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 	string gen_scaler_n_converter_desc(uint32 width, uint32 height)
 	{
 		if(null != Gst.ElementFactory.find("vaapih264enc")) {
+			/* NV12: vaapih264enc rejects YV12 (not-negotiated → no RTP). */
 			return ("! vaapipostproc " +
 							"scale-method=2 " +
-							"format=3 " +
 							"force-aspect-ratio=true " +
 					"! video/x-raw, " +
-							"format=YV12, " +
+							"format=NV12, " +
 							"width=%u, " +
 							"height=%u ").printf(width, height);
 		}
@@ -137,26 +142,35 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 		return ("! videoscale method=0 add-borders=true " +
 			"! video/x-raw, width=%u, height=%u " +
 			"! videoconvert " +
-			"! video/x-raw, format=YV12 ").printf(width, height);
+			"! video/x-raw, format=NV12 ").printf(width, height);
 	}
 
 	string gen_encoder_desc(uint32 framerate)
 	{
+		/* Align encoder GOP with forced-IDR interval (5s). */
+		uint32 key_int = framerate * (IDR_INTERVAL_MS / 1000);
+		if(key_int < 1) {
+			key_int = 1;
+		}
+
 		if(null != Gst.ElementFactory.find("vaapih264enc")) {
-				return ("! vaapih264enc " +
-							"rate-control=1 " +
-							"num-slices=1 " +      /* in WFD spec, one slice per frame */
-							"max-bframes=0 " +     /* in H264 CHP, no bframe supporting */
-							"cabac=true " +        /* in H264 CHP, CABAC entropy codeing is supported, but need more processing to decode */
-							"dct8x8=true " +       /* in H264 CHP, DTC is supported */
-							"cpb-length=1000 " +   /* shortent buffer in order to decrease latency */
-							"keyframe-period=%u ").printf(framerate);
+				/* No GObject "profile" prop on vaapih264enc; force via caps. */
+				return ("! vaapih264enc name=venc " +
+							"rate-control=cbr " +
+							"bitrate=5000 " +
+							"num-slices=1 " +
+							"max-bframes=0 " +
+							"cabac=false " +
+							"dct8x8=false " +
+							"cpb-length=1000 " +
+							"keyframe-period=%u " +
+					"! video/x-h264,profile=constrained-baseline ").printf(key_int);
 		}
 
 		info("vaapih264enc not available, use x264enc instead");
 
-		return ("! x264enc pass=4 b-adapt=false key-int-max=%u " +
-						"speed-preset=4 tune=4 ").printf(framerate);
+		return ("! x264enc name=venc pass=cbr bitrate=5000 b-adapt=false key-int-max=%u " +
+						"speed-preset=4 tune=zerolatency profile=baseline ").printf(key_int);
 	}
 
 	public void configure(HashTable<DispdEncoderConfig, Variant> configs) throws DispdEncoderError
@@ -185,10 +199,27 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 						"! video/x-h264, " +
 							"alignment=nal, " +
 							"stream-format=byte-stream " +
-						"%s " +						/* add queue if audio enabled */
-						"! mpegtsmux " +
+						"! queue " +
+							"max-size-buffers=0 " +
+							"max-size-bytes=0 " +
+						/* WFD D.4.2: video elementary_PID 0x1011 */
+						"! muxer.sink_4113 " +
+						/*
+						 * WFD D.4.2 PID map (Appendix D.4.2):
+						 *   PMT 0x0100, video 0x1011, audio 0x1100.
+						 * PCR: mpegtsmux cannot emit a PCR-only PID 0x1000;
+						 * carry PCR on the video PID (matches ES 0x1011).
+						 */
+						"mpegtsmux " +
 							"name=muxer " +
+							"prog-map=\"program_map," +
+								"sink_4113=(int)1," +
+								"sink_4352=(int)1," +
+								"PMT_1=(uint)256," +
+								"PCR_1=sink_4113\" " +
+							"alignment=7 " +
 						"! rtpmp2tpay " +
+							"ssrc=%u " +
 						"! .send_rtp_sink_0 " +
 						"rtpbin " +
 							"name=session " +
@@ -204,6 +235,7 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 						"! udpsink " +
 							"sync=false " +
 							"async=false " +
+							"bind-port=%u " +
 							"host=\"%s\" " +
 							"port=%u ",
 						configs.contains(DispdEncoderConfig.X)
@@ -217,9 +249,12 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 						framerate,
 						gen_scaler_n_converter_desc(width, height),
 						gen_encoder_desc(framerate),
-						configs.contains(DispdEncoderConfig.AUDIO_TYPE)
-							? "! queue max-size-buffers=0 max-size-bytes=0"
-							: "",
+						configs.contains(DispdEncoderConfig.RTP_SSRC)
+							? configs.get(DispdEncoderConfig.RTP_SSRC).get_uint32()
+							: 0xb9410795u,
+						configs.contains(DispdEncoderConfig.LOCAL_RTP_PORT)
+							? configs.get(DispdEncoderConfig.LOCAL_RTP_PORT).get_uint32()
+							: 16384,
 						configs.contains(DispdEncoderConfig.PEER_ADDRESS)
 							? configs.get(DispdEncoderConfig.PEER_ADDRESS).get_string()
 							: "",
@@ -252,24 +287,34 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 								: 16385);
 		}
 
+		/*
+		 * M4 always advertises AAC; mux silent AAC so the TS matches
+		 * negotiation (video-only TS caused black screen on some Sinks).
+		 */
+		desc.append("audiotestsrc " +
+						"name=asrc " +
+						"wave=silence " +
+						"is-live=true " +
+						"do-timestamp=true " +
+					"! audio/x-raw, " +
+						"rate=48000, " +
+						"channels=2 " +
+					"! audioconvert " +
+					"! avenc_aac " +
+					"! audio/mpeg, " +
+						"mpegversion=4, " +
+						"stream-format=raw, " +
+						"channels=2, " +
+						"rate=48000 " +
+					"! queue " +
+						"max-size-buffers=0 " +
+						"max-size-bytes=0 " +
+						"max-size-time=0 " +
+					/* WFD D.4.2: audio elementary_PID 0x1100 */
+					"! muxer.sink_4352 ");
+
 		if(configs.contains(DispdEncoderConfig.AUDIO_TYPE)) {
-			desc.append_printf("pulsesrc " +
-								"do-timestamp=true " +
-								"client-name=miraclecast " +
-								"device=\"%s\" " +
-							"! avenc_aac " +
-							"! audio/mpeg, " +
-								"channels=2, " +
-								"rate=48000 " +
-//								"base-profile=lc " +
-							"! queue " +
-								"max-size-buffers=0 " +
-								"max-size-bytes=0 " +
-								"max-size-time=0 " +
-							"! muxer. ",
-							configs.contains(DispdEncoderConfig.AUDIO_DEV)
-								? configs.get(DispdEncoderConfig.AUDIO_DEV).get_string()
-								: "");
+			info("AUDIO_TYPE set; using silent AAC (pulsesrc not used)");
 		}
 
 		info("final pipeline description: %s", desc.str);
@@ -295,12 +340,19 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 		check_configs();
 
 		pipeline.set_state(Gst.State.PLAYING);
+		/* First IDR soon after PLAYING; then periodic IDRs. */
+		Timeout.add(50, () => {
+			force_idr();
+			return false;
+		});
+		start_idr_timer();
 	}
 
 	public void pause() throws DispdEncoderError
 	{
 		check_configs();
 
+		stop_idr_timer();
 		pipeline.set_state(Gst.State.PAUSED);
 	}
 
@@ -310,9 +362,47 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 			return;
 		}
 
+		stop_idr_timer();
 		pipeline.set_state(Gst.State.NULL);
 		state = DispdEncoderState.NULL;
 		defered_terminate();
+	}
+
+	private void force_idr()
+	{
+		if(null == pipeline) {
+			return;
+		}
+
+		var enc = ((Gst.Bin) pipeline).get_by_name("venc");
+		if(null == enc) {
+			warning("force_idr: encoder element 'venc' not found");
+			return;
+		}
+
+		var s = new Gst.Structure.empty("GstForceKeyUnit");
+		s.set_value("all-headers", true);
+		var ev = new Gst.Event.custom(Gst.EventType.CUSTOM_DOWNSTREAM, (owned) s);
+		if(!enc.send_event(ev)) {
+			warning("force_idr: send_event failed");
+		}
+	}
+
+	private void start_idr_timer()
+	{
+		stop_idr_timer();
+		idr_timer_id = Timeout.add(IDR_INTERVAL_MS, () => {
+			force_idr();
+			return true;
+		});
+	}
+
+	private void stop_idr_timer()
+	{
+		if(0 != idr_timer_id) {
+			Source.remove(idr_timer_id);
+			idr_timer_id = 0;
+		}
 	}
 
 	public async void prepare() throws Error

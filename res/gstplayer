@@ -88,10 +88,10 @@ class Player(object):
             # Add playbin to the pipeline
             self.pipeline.add(self.playbin)
         else:
-            gstcommand = "udpsrc port="+str(port)+" caps=\"application/x-rtp, media=video\" ! rtpjitterbuffer latency=100 ! rtpmp2tdepay ! tsdemux "
+            gstcommand = "udpsrc port="+str(port)+" caps=\"application/x-rtp, media=video, encoding-name=H264, payload=96\" ! rtpjitterbuffer latency=100 ! rtph264depay "
 
             if audio:
-                gstcommand += "name=demuxer demuxer. "
+                print("warning: --audio ignored (source no longer muxes AAC into MPEG-TS)")
 
             gstcommand += "! queue max-size-buffers=0 max-size-time=0 ! h264parse ! avdec_h264 ! videoconvert ! "
 
@@ -99,9 +99,6 @@ class Player(object):
                 gstcommand += "videoscale method=1 ! video/x-raw,width="+str(self.width)+",height="+str(self.height)+" ! "
 
             gstcommand += "autovideosink sync=false "
-
-            if audio:
-                gstcommand += "demuxer. ! queue max-size-buffers=0 max-size-time=0 ! aacparse ! avdec_aac ! audioconvert ! audioresample ! autoaudiosink sync=false "
 
             self.pipeline = Gst.parse_launch(gstcommand)
 

@@ -75,11 +75,11 @@ then
   RUN+="--gst-debug=${DEBUG} "
 fi
 
-RUN+="udpsrc port=$PORT caps=\"application/x-rtp, media=video\" ! rtpjitterbuffer latency=100 ! rtpmp2tdepay ! tsdemux "
+RUN+="udpsrc port=$PORT caps=\"application/x-rtp, media=video, encoding-name=H264, payload=96\" ! rtpjitterbuffer latency=100 ! rtph264depay "
 
 if [ $AUDIO == '1' ]
 then
-  RUN+="name=demuxer demuxer. "
+  echo "warning: -a ignored (source no longer muxes AAC into MPEG-TS)" >&2
 fi
 
 RUN+="! queue max-size-buffers=0 max-size-time=0 ! h264parse ! avdec_h264 ! videoconvert ! "
@@ -90,11 +90,6 @@ then
 fi
 
 RUN+="autovideosink "
-
-if [ $AUDIO == '1' ]
-then
-  RUN+="demuxer. ! queue max-size-buffers=0 max-size-time=0 ! aacparse ! avdec_aac ! audioconvert ! audioresample ! autoaudiosink "
-fi
 
 echo "running: $RUN"
 exec ${RUN}
