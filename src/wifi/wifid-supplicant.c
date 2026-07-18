@@ -21,13 +21,18 @@
 
 #include "config.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <systemd/sd-event.h>
 
 #ifdef ENABLE_SYSTEMD
@@ -41,6 +46,9 @@
 #include "util.h"
 #include "wifid.h"
 #include "wpas.h"
+
+#define XSTR(x) STR(x)
+#define STR(x) #x
 
 struct supplicant_group {
 	unsigned long users;
@@ -71,6 +79,8 @@ struct supplicant_peer {
 	char *prov;
 	char *pin;
 	char *sta_mac;
+	/* From P2P group_capab; bit0 = Group Owner (peer already operates as GO). */
+	unsigned int group_capab;
 };
 
 struct supplicant {
@@ -114,6 +124,8 @@ enum wps_dev_password_id {
 
 static void supplicant_failed(struct supplicant *s);
 static void supplicant_peer_drop_group(struct supplicant_peer *sp);
+static void supplicant_group_mark_connected(struct supplicant_group *g,
+					   const char *go_ip_addr);
 
 static struct supplicant_peer *find_peer_by_p2p_mac(struct supplicant *s,
 						    const char *p2p_mac)
@@ -171,6 +183,7 @@ static void supplicant_group_free(struct supplicant_group *g)
 {
 	_wpas_message_unref_ struct wpas_message *m = NULL;
 	struct peer *p;
+	struct supplicant_peer *sp;
 	int r;
 
 	if (!g)
@@ -195,6 +208,24 @@ static void supplicant_group_free(struct supplicant_group *g)
 		log_vERR(r);
 	}
 
+	/*
+	 * Detach all peers (iface + p2p_dev may share one group). Do not call
+	 * drop_group here — that would recurse back into group_free.
+	 */
+	LINK_FOREACH_PEER(p, g->s->l) {
+		sp = p->sp;
+		if (!sp || sp->g != g)
+			continue;
+		sp->g = NULL;
+		free(sp->remote_addr);
+		sp->remote_addr = NULL;
+		free(sp->sta_mac);
+		sp->sta_mac = NULL;
+		peer_supplicant_connected_changed(p, false);
+	}
+	g->sp = NULL;
+	g->users = 0;
+
 	if (g->dhcp_pid > 0) {
 		sd_event_source_unref(g->dhcp_pid_source);
 		g->dhcp_pid_source = NULL;
@@ -215,12 +246,6 @@ static void supplicant_group_free(struct supplicant_group *g)
 		g->dhcp_comm_source = NULL;
 		close(g->dhcp_comm);
 		g->dhcp_comm = -1;
-	}
-
-	LINK_FOREACH_PEER(p, g->s->l)
-	if (p->sp->g == g) {
-		supplicant_peer_drop_group(p->sp);
-		return;
 	}
 
 	shl_dlist_unlink(&g->list);
@@ -318,11 +343,10 @@ static int supplicant_group_comm_fn(sd_event_source *source,
 	}
 
 	if (g->local_addr) {
-		if (g->sp) {
-			p = g->sp->p;
-			if (p->sp->remote_addr)
-				peer_supplicant_connected_changed(p, true);
-		} else {
+		if (g->sp && g->sp->remote_addr) {
+			/* Client: primary has gateway — fan-out to all peers. */
+			supplicant_group_mark_connected(g, NULL);
+		} else if (!g->sp) {
 			LINK_FOREACH_PEER(p, g->s->l) {
 				if (p->sp->g != g || !p->sp->remote_addr)
 					continue;
@@ -443,6 +467,173 @@ static int supplicant_group_spawn_dhcp_server(struct supplicant_group *g,
 	return 0;
 }
 
+/*
+ * Convert dotted IPv4 netmask (or decimal prefix) to CIDR prefix length.
+ * Defaults to /24 when missing or invalid.
+ */
+static int p2p_netmask_to_prefix(const char *mask)
+{
+	struct in_addr a;
+	uint32_t m;
+	int n = 0;
+
+	if (!mask || !*mask)
+		return 24;
+
+	if (!strchr(mask, '.')) {
+		n = atoi(mask);
+		if (n >= 0 && n <= 32)
+			return n;
+		return 24;
+	}
+
+	if (inet_pton(AF_INET, mask, &a) != 1)
+		return 24;
+
+	m = ntohl(a.s_addr);
+	while (m & 0x80000000U) {
+		++n;
+		m <<= 1;
+	}
+
+	return n;
+}
+
+static const char *supplicant_ip_binary(struct supplicant_group *g)
+{
+	if (g && g->s && g->s->l && g->s->l->ip_binary)
+		return g->s->l->ip_binary;
+
+	return XSTR(IP_BINARY);
+}
+
+static int supplicant_run_ip(struct supplicant_group *g, char **argv)
+{
+	pid_t pid, rp;
+	sigset_t mask;
+	int status;
+
+	pid = fork();
+	if (pid < 0)
+		return log_ERRNO();
+
+	if (!pid) {
+		sigemptyset(&mask);
+		sigprocmask(SIG_SETMASK, &mask, NULL);
+		dup2(2, 1);
+		execve(argv[0], argv, environ);
+		_exit(1);
+	}
+
+	rp = waitpid(pid, &status, 0);
+	if (rp != pid)
+		return -EFAULT;
+	if (!WIFEXITED(status) || WEXITSTATUS(status))
+		return -EFAULT;
+
+	return 0;
+}
+
+/*
+ * Apply GO-assigned P2P IP from P2P-GROUP-STARTED onto the group iface.
+ * Used for client joins (e.g. Windows Miracast GO) so RTSP listens on the
+ * address the peer will connect to.
+ */
+static int supplicant_group_apply_p2p_ip(struct supplicant_group *g,
+					const char *ip_addr,
+					const char *ip_mask)
+{
+	char cidr[INET_ADDRSTRLEN + 4];
+	char *argv[8];
+	const char *ipbin;
+	char *local;
+	int prefix;
+	int i;
+	int r;
+
+	if (!g || !ip_addr || !*ip_addr)
+		return log_EINVAL();
+
+	prefix = p2p_netmask_to_prefix(ip_mask);
+	r = snprintf(cidr, sizeof(cidr), "%s/%d", ip_addr, prefix);
+	if (r < 0 || (size_t)r >= sizeof(cidr))
+		return -EINVAL;
+
+	ipbin = supplicant_ip_binary(g);
+
+	i = 0;
+	argv[i++] = (char *)ipbin;
+	argv[i++] = "addr";
+	argv[i++] = "flush";
+	argv[i++] = "dev";
+	argv[i++] = g->ifname;
+	argv[i] = NULL;
+	r = supplicant_run_ip(g, argv);
+	if (r < 0) {
+		log_warning("cannot flush addresses on %s via %s",
+			    g->ifname, ipbin);
+		return r;
+	}
+
+	i = 0;
+	argv[i++] = (char *)ipbin;
+	argv[i++] = "addr";
+	argv[i++] = "add";
+	argv[i++] = cidr;
+	argv[i++] = "dev";
+	argv[i++] = g->ifname;
+	argv[i] = NULL;
+	r = supplicant_run_ip(g, argv);
+	if (r < 0) {
+		log_error("cannot add %s on %s via %s",
+			  cidr, g->ifname, ipbin);
+		return r;
+	}
+
+	local = strdup(ip_addr);
+	if (!local)
+		return log_ENOMEM();
+
+	free(g->local_addr);
+	g->local_addr = local;
+
+	log_info("applied P2P ip_addr %s on %s (skip DHCP)",
+		 cidr, g->ifname);
+
+	return 0;
+}
+
+/*
+ * Mark every peer bound to this group as Connected. Windows GO often uses
+ * different iface vs p2p_dev MACs; both peer objects may share the group.
+ */
+static void supplicant_group_mark_connected(struct supplicant_group *g,
+					   const char *go_ip_addr)
+{
+	struct peer *p;
+	struct supplicant_peer *sp;
+	const char *remote;
+
+	if (!g || !g->local_addr)
+		return;
+
+	remote = (go_ip_addr && *go_ip_addr) ? go_ip_addr : NULL;
+	if (!remote && g->sp)
+		remote = g->sp->remote_addr;
+
+	LINK_FOREACH_PEER(p, g->s->l) {
+		sp = p->sp;
+		if (!sp || sp->g != g)
+			continue;
+		if (remote && !sp->remote_addr) {
+			sp->remote_addr = strdup(remote);
+			if (!sp->remote_addr)
+				log_vENOMEM();
+		}
+		peer_supplicant_connected_changed(p, true);
+	}
+}
+
 static int supplicant_group_spawn_dhcp_client(struct supplicant_group *g)
 {
 	char *argv[64], loglevel[64], commfd[64];
@@ -531,11 +722,15 @@ static int supplicant_group_spawn_dhcp_client(struct supplicant_group *g)
 static int supplicant_group_new(struct supplicant *s,
 				struct supplicant_group **out,
 				const char *ifname,
-				bool go)
+				bool go,
+				const char *p2p_ip_addr,
+				const char *p2p_ip_mask,
+				const char *p2p_go_ip)
 {
 	struct supplicant_group *g, *j;
 	struct shl_dlist *i;
 	unsigned int subnet;
+	bool use_dhcp = true;
 	int r;
 
 	if (!s || !ifname)
@@ -580,32 +775,48 @@ static int supplicant_group_new(struct supplicant *s,
 			log_warning("out of free subnets for local groups");
 			r = -EINVAL;
 		}
+	} else if (p2p_ip_addr && *p2p_ip_addr) {
+		r = supplicant_group_apply_p2p_ip(g, p2p_ip_addr, p2p_ip_mask);
+		if (r < 0) {
+			log_warning("P2P ip_addr %s apply failed on %s, falling back to DHCP",
+				    p2p_ip_addr, g->ifname);
+			r = supplicant_group_spawn_dhcp_client(g);
+		} else {
+			use_dhcp = false;
+			if (p2p_go_ip && *p2p_go_ip) {
+				/* remote filled when peer is attached */
+				log_debug("P2P go_ip_addr=%s for %s",
+					  p2p_go_ip, g->ifname);
+			}
+		}
 	} else {
 		r = supplicant_group_spawn_dhcp_client(g);
 	}
 	if (r < 0)
 		goto error;
 
-	r = sd_event_add_io(s->l->m->event,
-			    &g->dhcp_comm_source,
-			    g->dhcp_comm,
-			    EPOLLHUP | EPOLLERR | EPOLLIN,
-			    supplicant_group_comm_fn,
-			    g);
-	if (r < 0) {
-		log_vERR(r);
-		goto error;
-	}
+	if (use_dhcp) {
+		r = sd_event_add_io(s->l->m->event,
+				    &g->dhcp_comm_source,
+				    g->dhcp_comm,
+				    EPOLLHUP | EPOLLERR | EPOLLIN,
+				    supplicant_group_comm_fn,
+				    g);
+		if (r < 0) {
+			log_vERR(r);
+			goto error;
+		}
 
-	r = sd_event_add_child(s->l->m->event,
-			       &g->dhcp_pid_source,
-			       g->dhcp_pid,
-			       WEXITED,
-			       supplicant_group_pid_fn,
-			       g);
-	if (r < 0) {
-		log_vERR(r);
-		goto error;
+		r = sd_event_add_child(s->l->m->event,
+				       &g->dhcp_pid_source,
+				       g->dhcp_pid,
+				       WEXITED,
+				       supplicant_group_pid_fn,
+				       g);
+		if (r < 0) {
+			log_vERR(r);
+			goto error;
+		}
 	}
 
 	shl_dlist_link(&s->groups, &g->list);
@@ -661,13 +872,15 @@ static void supplicant_peer_set_group(struct supplicant_peer *sp,
 
 static void supplicant_peer_drop_group(struct supplicant_peer *sp)
 {
-	if (!sp->g)
+	struct supplicant_group *g;
+
+	if (!sp || !sp->g)
 		return;
 
-	if (sp->g->sp == sp)
-		sp->g = NULL;
+	g = sp->g;
+	if (g->sp == sp)
+		g->sp = NULL;
 
-	supplicant_group_drop(sp->g);
 	sp->g = NULL;
 
 	free(sp->remote_addr);
@@ -676,6 +889,8 @@ static void supplicant_peer_drop_group(struct supplicant_peer *sp)
 	sp->sta_mac = NULL;
 
 	peer_supplicant_connected_changed(sp->p, false);
+
+	supplicant_group_drop(g);
 }
 
 static int supplicant_peer_new(struct supplicant *s,
@@ -791,7 +1006,9 @@ int supplicant_peer_connect(struct supplicant_peer *sp,
 	if (!pin)
 		pin = sp->pin;
 
-	log_debug("connect to %s via %s/%s", sp->p->p2p_mac, prov_type, pin);
+	log_debug("connect to %s via %s/%s%s",
+		  sp->p->p2p_mac, prov_type, pin,
+		  (sp->group_capab & 0x01) ? " join" : "");
 
 	r = wpas_message_new_request(sp->s->bus_global,
 				     "P2P_CONNECT",
@@ -830,6 +1047,16 @@ int supplicant_peer_connect(struct supplicant_peer *sp,
 			return log_ERR(r);
 	} else {
 		return -EINVAL;
+	}
+
+	/*
+	 * Peer already advertises Group Owner (group_capab bit0): skip GO
+	 * negotiation and join the existing group as client (e.g. Win10 sink).
+	 */
+	if (sp->group_capab & 0x01) {
+		r = wpas_message_append(m, "s", "join");
+		if (r < 0)
+			return log_ERR(r);
 	}
 
 	r = wpas_call_async(sp->s->bus_global, m, NULL, NULL, 0, NULL);
@@ -952,6 +1179,11 @@ static void supplicant_parse_peer(struct supplicant *s,
 		}
 	}
 
+	r = wpas_message_dict_read(m, "group_capab", 's', &val);
+	if (r >= 0) {
+		sp->group_capab = (unsigned int)strtoul(val, NULL, 0);
+	}
+
 	if (s->running)
 		peer_supplicant_started(sp->p);
 }
@@ -984,7 +1216,8 @@ static void supplicant_event_p2p_device_found(struct supplicant *s,
 					      struct wpas_message *ev)
 {
 	_wpas_message_unref_ struct wpas_message *m = NULL;
-	const char *mac;
+	struct supplicant_peer *sp_dev;
+	const char *mac, *gcap;
 	int r;
 
 	/*
@@ -1000,6 +1233,25 @@ static void supplicant_event_p2p_device_found(struct supplicant *s,
 	}
 
 	supplicant_parse_peer(s, ev);
+
+	/*
+	 * DEVICE-FOUND lists iface MAC first and p2p_dev_addr separately.
+	 * Connect uses p2p_dev_addr — stamp group_capab there immediately so
+	 * join works even before the async P2P_PEER reply.
+	 */
+	if (wpas_message_dict_read(ev, "group_capab", 's', &gcap) >= 0) {
+		sp_dev = find_peer_by_p2p_mac(s, mac);
+		if (!sp_dev) {
+			r = supplicant_peer_new(s, mac, &sp_dev);
+			if (r < 0)
+				sp_dev = NULL;
+		}
+		if (sp_dev) {
+			sp_dev->group_capab = (unsigned int)strtoul(gcap, NULL, 0);
+			if (s->running)
+				peer_supplicant_started(sp_dev->p);
+		}
+	}
 
 	r = wpas_message_new_request(s->bus_global,
 				     "P2P_PEER",
@@ -1266,7 +1518,9 @@ static void supplicant_event_p2p_group_started(struct supplicant *s,
 	struct supplicant_peer *sp;
 	struct supplicant_group *g;
 	const char *mac, *ssid, *ifname, *go;
+	const char *ip_addr = NULL, *ip_mask = NULL, *go_ip = NULL;
 	bool is_go;
+	bool created = false;
 	int r;
 
 	r = wpas_message_dict_read(ev, "go_dev_addr", 's', &mac);
@@ -1297,6 +1551,16 @@ static void supplicant_event_p2p_group_started(struct supplicant *s,
 
 	is_go = !strcmp(go, "GO");
 
+	/* Optional P2P IP assignment from GO (WPS/IP config). */
+	wpas_message_dict_read(ev, "ip_addr", 's', &ip_addr);
+	wpas_message_dict_read(ev, "ip_mask", 's', &ip_mask);
+	wpas_message_dict_read(ev, "go_ip_addr", 's', &go_ip);
+	if (ip_addr)
+		log_debug("P2P-GROUP-STARTED ip_addr=%s ip_mask=%s go_ip_addr=%s",
+			  ip_addr,
+			  ip_mask ? ip_mask : "(none)",
+			  go_ip ? go_ip : "(none)");
+
 	sp = find_peer_by_p2p_mac(s, mac);
 	if (!sp) {
 		if (!s->p2p_mac || strcmp(s->p2p_mac, mac)) {
@@ -1308,10 +1572,14 @@ static void supplicant_event_p2p_group_started(struct supplicant *s,
 
 	g = find_group_by_ifname(s, ifname);
 	if (!g) {
-		r = supplicant_group_new(s, &g, ifname, is_go);
+		r = supplicant_group_new(s, &g, ifname, is_go,
+					 is_go ? NULL : ip_addr,
+					 is_go ? NULL : ip_mask,
+					 is_go ? NULL : go_ip);
 		if (r < 0)
 			return;
 
+		created = true;
 		log_debug("start %s group on new group %s as %s/%d",
 			  sp ? "remote" : "local", g->ifname, go, is_go);
 	} else {
@@ -1319,10 +1587,34 @@ static void supplicant_event_p2p_group_started(struct supplicant *s,
 			  sp ? "remote" : "local", g->ifname, go, is_go);
 	}
 
-	if (sp) {
+	/*
+	 * Bind peers to the group. Windows Miracast GO often has distinct
+	 * iface MAC (Connect/join target, kept in s->pending) and p2p_dev
+	 * MAC (go_dev_addr). Upper layers wait on the Connect peer — make
+	 * that the primary g->sp, and attach go_dev as well when different.
+	 */
+	if (!is_go && s->pending) {
+		if (sp && s->pending != sp)
+			supplicant_peer_set_group(sp, g);
+		supplicant_peer_set_group(s->pending, g);
+		g->sp = s->pending;
+		log_debug("group %s primary peer %s (go_dev %s)",
+			  g->ifname,
+			  s->pending->p->p2p_mac,
+			  sp ? sp->p->p2p_mac : "(none)");
+		s->pending = NULL;
+	} else if (sp) {
 		supplicant_peer_set_group(sp, g);
 		g->sp = sp;
 	}
+
+	/*
+	 * P2P IP path already set local_addr without DHCP. Mark connected
+	 * once the peer is attached so LocalAddress/RemoteAddress are ready
+	 * for RTSP.
+	 */
+	if (created && !is_go && g->local_addr && g->dhcp_pid <= 0)
+		supplicant_group_mark_connected(g, go_ip);
 
 	/* TODO: For local-groups, we should schedule some timer so the
 	 * group gets removed in case the remote side never connects. */
@@ -1586,22 +1878,6 @@ static void supplicant_try_ready(struct supplicant *s)
 	link_supplicant_p2p_state_known(s->l, s->has_p2p ? 1 : -1);
 }
 
-static int supplicant_p2p_set_disallow_freq_fn(struct wpas *w,
-					       struct wpas_message *reply,
-					       void *data)
-{
-	struct supplicant *s = data;
-
-	/* P2P_SET disallow_freq received */
-	--s->setup_cnt;
-
-	if (!wpas_message_is_ok(reply))
-		log_warning("cannot set p2p disallow_freq field");
-
-	supplicant_try_ready(s);
-	return 0;
-}
-
 static int supplicant_init_p2p_peer_fn(struct wpas *w,
 				       struct wpas_message *reply,
 				       void *data)
@@ -1785,36 +2061,6 @@ static int supplicant_status_fn(struct wpas *w,
 				    m,
 				    NULL,
 				    NULL,
-				    0,
-				    NULL);
-		wpas_message_unref(m);
-		m = NULL;
-		if (r < 0) {
-			log_vERR(r);
-			goto error;
-		}
-
-		/* require P2P_SET disallow_freq response */
-		++s->setup_cnt;
-
-		r = wpas_message_new_request(s->bus_global,
-					     "P2P_SET",
-					     &m);
-		if (r < 0) {
-			log_vERR(r);
-			goto error;
-		}
-
-		r = wpas_message_append(m, "ss", "disallow_freq", "5180-5900");
-		if (r < 0) {
-			log_vERR(r);
-			goto error;
-		}
-
-		r = wpas_call_async(s->bus_global,
-				    m,
-				    supplicant_p2p_set_disallow_freq_fn,
-				    s,
 				    0,
 				    NULL);
 		wpas_message_unref(m);

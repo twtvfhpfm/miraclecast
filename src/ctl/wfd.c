@@ -610,6 +610,7 @@ int wfd_audio_codecs_from_string(const char *l,
 	_shl_free_ char *f = NULL;
 	int r, i, n_caps;
 	const char *p;
+	size_t skip;
 
 	assert(l);
 
@@ -625,25 +626,38 @@ int wfd_audio_codecs_from_string(const char *l,
 
 	c = malloc(sizeof(struct wfd_audio_codecs)
 					+ (sizeof(c->caps[0]) * n_caps));
+	if(!c) {
+		return -ENOMEM;
+	}
 
 	for(i = 0; i < n_caps; i ++) {
+		while(*l == ' ' || *l == ',')
+			++l;
+
 		r = sscanf(l, "%ms %8x %2hhx",
 						&f,
 						&c->caps[i].modes,
 						&c->caps[i].latency);
 		if(r != 3) {
+			free(f);
+			f = NULL;
 			return -EINVAL;
 		}
 
 		r = wfd_audio_format_from_string(f, &c->caps[i].format);
 		if(0 > r) {
+			free(f);
+			f = NULL;
 			return r;
 		}
 
-		l += 16;
-		if(WFD_AUDIO_FORMAT_LPCM == c->caps[i].format) {
-			++ l;
-		}
+		/*
+		 * Advance past "FORMAT XXXXXXXX XX". Old code used a fixed
+		 * +16 (+1 for LPCM only), which breaks on AAC/AC3 (3-letter
+		 * names) — e.g. Windows "LPCM ..., AAC ..., AC3 ...".
+		 */
+		skip = strlen(f) + 1 + 8 + 1 + 2;
+		l += skip;
 
 		free(f);
 		f = NULL;
