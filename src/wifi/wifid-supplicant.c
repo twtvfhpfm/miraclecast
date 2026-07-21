@@ -1059,7 +1059,9 @@ int supplicant_peer_connect(struct supplicant_peer *sp,
 			return log_ERR(r);
 	}
 
-	r = wpas_call_async(sp->s->bus_global, m, NULL, NULL, 0, NULL);
+	/* join/GO-neg: OK may be delayed while wpas stops scan; use 30s. */
+	r = wpas_call_async(sp->s->bus_global, m, NULL, NULL,
+			    30ULL * 1000ULL * 1000ULL, NULL);
 	if (r < 0)
 		return log_ERR(r);
 

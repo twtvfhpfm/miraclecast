@@ -796,7 +796,20 @@ static int dispd_out_session_handle_idr_request(struct dispd_session *s,
 				struct rtsp_message *req,
 				struct rtsp_message **out_rep)
 {
-	int r = rtsp_message_new_reply_for(req,
+	struct dispd_encoder *e;
+	int r;
+
+	e = dispd_out_session(s)->encoder;
+	if(e) {
+		r = dispd_encoder_force_idr(e);
+		if(0 > r) {
+			log_warning("wfd_idr_request: ForceIdr failed: %d", r);
+		}
+	} else {
+		log_debug("wfd_idr_request: no encoder yet");
+	}
+
+	r = rtsp_message_new_reply_for(req,
 					out_rep,
 					RTSP_CODE_OK,
 					NULL);
@@ -870,9 +883,10 @@ static int dispd_out_session_request_set_parameter(struct dispd_session *s,
 
 	s->stream.id = DISPD_STREAM_ID_PRIMARY;
 
+	/* Video-only: match gstencoder (no AAC ES). */
 	r = asprintf(&body,
 					"wfd_video_formats: 00 00 01 10 %08X %08X %08X 00 0000 0000 00 none none\r\n"
-					"wfd_audio_codecs: AAC 00000001 00\r\n"
+					"wfd_audio_codecs: none\r\n"
 					"wfd_presentation_URL: %s none\r\n"
 					"wfd_client_rtp_ports: RTP/AVP/UDP;unicast %u %u mode=play",
 					//"wfd_uibc_capability: input_category_list=GENERIC\r\n;generic_cap_list=SingleTouch;hidc_cap_list=none;port=5100\r\n"

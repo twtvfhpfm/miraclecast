@@ -949,6 +949,46 @@ int dispd_encoder_pause(struct dispd_encoder *e)
 	return dispd_encoder_call(e, "Pause");
 }
 
+int dispd_encoder_force_idr(struct dispd_encoder *e)
+{
+	_cleanup_sd_bus_message_ sd_bus_message *call = NULL;
+	_cleanup_sd_bus_message_ sd_bus_message *reply = NULL;
+	_cleanup_sd_bus_error_ sd_bus_error error = SD_BUS_ERROR_NULL;
+	int r;
+
+	assert_ret(e);
+
+	if(!e->bus || !e->bus_name) {
+		return log_ERR(-ENOTCONN);
+	}
+
+	if(DISPD_ENCODER_STATE_STARTED != e->state) {
+		log_debug("force_idr: skip, encoder state=%s",
+						state_to_name(e->state));
+		return 0;
+	}
+
+	r = sd_bus_message_new_method_call(e->bus,
+					&call,
+					e->bus_name,
+					"/org/freedesktop/miracle/encoder",
+					"org.freedesktop.miracle.encoder",
+					"ForceIdr");
+	if(0 > r) {
+		return log_ERR(r);
+	}
+
+	r = sd_bus_call(e->bus, call, 0, &error, &reply);
+	if(0 > r) {
+		log_warning("ForceIdr: %s: %s",
+						error.name ? error.name : "error",
+						error.message ? error.message : "");
+		return r;
+	}
+
+	return 0;
+}
+
 static int on_child_term_timeout(sd_event_source *s,
 				uint64_t usec,
 				void *userdata)

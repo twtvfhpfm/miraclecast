@@ -86,6 +86,8 @@ int dispd_encoder_configure(struct dispd_encoder *e, struct dispd_session *s);
 int dispd_encoder_start(struct dispd_encoder *e);
 int dispd_encoder_pause(struct dispd_encoder *e);
 int dispd_encoder_stop(struct dispd_encoder *e);
+/* Best-effort: Sink wfd_idr_request → gstencoder ForceIdr (does not kill child on fail) */
+int dispd_encoder_force_idr(struct dispd_encoder *e);
 
 void dispd_encoder_set_handler(struct dispd_encoder *e,
 				dispd_encoder_state_change_handler handler,

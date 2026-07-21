@@ -75,6 +75,8 @@ public interface DispdEncoder : GLib.Object
 	public abstract void start() throws DispdEncoderError;
 	public abstract void pause() throws DispdEncoderError;
 	public abstract void stop() throws DispdEncoderError;
+	/* Sink SET_PARAMETER wfd_idr_request (M13) → ForceKeyUnit */
+	public abstract void force_idr() throws DispdEncoderError;
 }
 
 internal class GstEncoder : DispdEncoder, GLib.Object
@@ -85,8 +87,11 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 	private Gst.State pipeline_state = Gst.State.NULL;
 	private DispdEncoderState _state = DispdEncoderState.NULL;
 	private uint idr_timer_id = 0;
+	private int64 last_idr_ms = 0;
 	/* Force IDR every 5s so sinks that join late / drop early packets recover. */
 	private const uint IDR_INTERVAL_MS = 5000;
+	/* Coalesce Sink IDR spam (e.g. 8A) and timer/request overlap. */
+	private const uint IDR_MIN_INTERVAL_MS = 300;
 
 	public DispdEncoderState state {
 		get { return _state; }
@@ -205,16 +210,13 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 						/* WFD D.4.2: video elementary_PID 0x1011 */
 						"! muxer.sink_4113 " +
 						/*
-						 * WFD D.4.2 PID map (Appendix D.4.2):
-						 *   PMT 0x0100, video 0x1011, audio 0x1100.
-						 * PCR: mpegtsmux cannot emit a PCR-only PID 0x1000;
-						 * carry PCR on the video PID (matches ES 0x1011).
+						 * Video-only TS (no AAC) for Sink compatibility test.
+						 * PCR on video PID 0x1011; PMT 0x0100.
 						 */
 						"mpegtsmux " +
 							"name=muxer " +
 							"prog-map=\"program_map," +
 								"sink_4113=(int)1," +
-								"sink_4352=(int)1," +
 								"PMT_1=(uint)256," +
 								"PCR_1=sink_4113\" " +
 							"alignment=7 " +
@@ -287,36 +289,6 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 								: 16385);
 		}
 
-		/*
-		 * M4 always advertises AAC; mux silent AAC so the TS matches
-		 * negotiation (video-only TS caused black screen on some Sinks).
-		 */
-		desc.append("audiotestsrc " +
-						"name=asrc " +
-						"wave=silence " +
-						"is-live=true " +
-						"do-timestamp=true " +
-					"! audio/x-raw, " +
-						"rate=48000, " +
-						"channels=2 " +
-					"! audioconvert " +
-					"! avenc_aac " +
-					"! audio/mpeg, " +
-						"mpegversion=4, " +
-						"stream-format=raw, " +
-						"channels=2, " +
-						"rate=48000 " +
-					"! queue " +
-						"max-size-buffers=0 " +
-						"max-size-bytes=0 " +
-						"max-size-time=0 " +
-					/* WFD D.4.2: audio elementary_PID 0x1100 */
-					"! muxer.sink_4352 ");
-
-		if(configs.contains(DispdEncoderConfig.AUDIO_TYPE)) {
-			info("AUDIO_TYPE set; using silent AAC (pulsesrc not used)");
-		}
-
 		info("final pipeline description: %s", desc.str);
 
 		this.configs = configs;
@@ -342,7 +314,7 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 		pipeline.set_state(Gst.State.PLAYING);
 		/* First IDR soon after PLAYING; then periodic IDRs. */
 		Timeout.add(50, () => {
-			force_idr();
+			emit_force_key_unit(true);
 			return false;
 		});
 		start_idr_timer();
@@ -368,9 +340,35 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 		defered_terminate();
 	}
 
-	private void force_idr()
+	/**
+	 * D-Bus ForceIdr: honor Sink wfd_idr_request (rate-limited).
+	 */
+	public void force_idr() throws DispdEncoderError
 	{
+		if(DispdEncoderState.STARTED != state) {
+			debug("force_idr: ignore, state=%s", state.to_string());
+			return;
+		}
+
+		emit_force_key_unit(true);
+	}
+
+	/**
+	 * Send GstForceKeyUnit to venc; optionally reset the 5s IDR timer.
+	 * @param reset_timer if true, restart periodic IDR after a successful emit
+	 */
+	private void emit_force_key_unit(bool reset_timer)
+	{
+		int64 now_ms;
+
 		if(null == pipeline) {
+			return;
+		}
+
+		now_ms = GLib.get_monotonic_time() / 1000;
+		if(0 != last_idr_ms &&
+						(now_ms - last_idr_ms) < (int64) IDR_MIN_INTERVAL_MS) {
+			debug("force_idr: rate limited");
 			return;
 		}
 
@@ -385,6 +383,12 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 		var ev = new Gst.Event.custom(Gst.EventType.CUSTOM_DOWNSTREAM, (owned) s);
 		if(!enc.send_event(ev)) {
 			warning("force_idr: send_event failed");
+			return;
+		}
+
+		last_idr_ms = now_ms;
+		if(reset_timer) {
+			start_idr_timer();
 		}
 	}
 
@@ -392,7 +396,7 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 	{
 		stop_idr_timer();
 		idr_timer_id = Timeout.add(IDR_INTERVAL_MS, () => {
-			force_idr();
+			emit_force_key_unit(false);
 			return true;
 		});
 	}

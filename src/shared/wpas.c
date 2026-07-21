@@ -43,8 +43,13 @@
 #  define UNIX_PATH_MAX (sizeof(((struct sockaddr_un*)0)->sun_path))
 #endif
 
-/* default timeout for messages is 500ms */
-#define WPAS_DEFAULT_TIMEOUT (500 * 1000ULL)
+/*
+ * Default timeout for ctrl-iface replies. 500ms is too short: P2P_CONNECT
+ * (especially join) often blocks in stop_find/abort_scan, and with
+ * wpa-loglevel=debug the OK can arrive after 500ms — miracle then HUPs the
+ * whole connection and kills wpas mid-join.
+ */
+#define WPAS_DEFAULT_TIMEOUT (5 * 1000ULL * 1000ULL)
 
 /* max message size */
 #define WPAS_MAX_LEN 16384
@@ -1520,6 +1525,8 @@ static int wpas_timer_fn(sd_event_source *source, uint64_t timeout, void *d)
 	 * delayed response coming in and WPAS doesn't provide serials/cookies.
 	 * We also cannot reopen the connection as this might cause missing
 	 * async-events. So lets just notify the HUP callback and close it. */
+	log_error("wpas ctrl reply timeout for '%s' - closing connection",
+		  m->name ? m->name : "<unknown>");
 
 	wpas__hup(w);
 
