@@ -194,7 +194,7 @@ internal class GstEncoder : DispdEncoder, GLib.Object
 						"ximagesrc " +
 							"name=vsrc " +
 							"use-damage=false " +
-							"show-pointer=false " +
+							"show-pointer=true " +
 							"startx=%u starty=%u endx=%u endy=%u " +
 						"! video/x-raw, " +
 							"framerate=%u/1 " +

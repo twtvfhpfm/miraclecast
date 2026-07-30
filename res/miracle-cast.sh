@@ -401,7 +401,7 @@ start_daemons() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONNECT_AP_SH="${CONNECT_AP_SH:-$SCRIPT_DIR/connect-ap-during-cast.sh}"
+CONNECT_AP_SH="${CONNECT_AP_SH:-connect-ap-during-cast.sh}"
 
 prompt_connect_ap() {
 	local choice
